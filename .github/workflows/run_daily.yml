@@ -1,0 +1,15 @@
+name: Run Python Daily
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 北京时间每天 9:00 = UTC 1:00
+  workflow_dispatch:       # 允许手动点按钮试跑
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python your_script.py
