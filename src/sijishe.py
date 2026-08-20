@@ -89,7 +89,7 @@ def get_login_params(session: requests.Session):
     referer = f"{MAIN_URL}/home.php?mod=space"
     resp = session.get(referer, headers={"Referer": f"{MAIN_URL}/"})
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "html.parser")
     el = soup.find("input", {"name": "formhash"})
     formhash = el["value"] if el and el.has_attr("value") else ""
     return {"formhash": formhash, "referer": referer}
