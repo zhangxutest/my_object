@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
-"""Sijishe CLI - Python port of the Rust sijishe client.
+"""Sijishe CLI - Python port (GitHub Actions hardened).
 
-Interacts with xsijishe.com: check-in and buy threads across multiple accounts.
-
-Original Rust behaviour is preserved:
-  - accounts are read from <config_dir>/sijishe/accounts.json
-  - each account gets its own cookie jar (a fresh requests.Session)
-  - login uses md5(password); check-in / buy parse the same DOM markers
+✅ Session + 浏览器级 Header
+✅ Cookie 注入（SIJISHE_COOKIE 优先）
+✅ 403 降级（不抛异常、不炸 workflow）
 """
 
 import hashlib
 import os
-import platform
 import random
 import string
 import sys
 import time
 from pathlib import Path
-import os
+
 import requests
 from bs4 import BeautifulSoup
-
 
 MAIN_URL = "https://xsijishe.com"
 
@@ -29,19 +24,19 @@ MAIN_URL = "https://xsijishe.com"
 # Helpers
 # --------------------------------------------------------------------------- #
 
-
-
 def get_accounts():
+    # Cookie 优先（Action 唯一稳的方式）
+    if os.getenv("SIJISHE_COOKIE"):
+        return [{"username": "cookie_user"}]
+
     username = os.environ.get("SIJISHE_USERNAME")
     password = os.environ.get("SIJISHE_PASSWORD")
     if not username or not password:
-        raise RuntimeError("Missing SIJISHE_USERNAME or SIJISHE_PASSWORD env var")
+        raise RuntimeError("Missing SIJISHE_USERNAME / PASSWORD / COOKIE")
     return [{"username": username, "password": password}]
 
 
-
 def get_random_string(length: int) -> str:
-    """Alphabetic-only random string, like rand::distr::Alphabetic."""
     return "".join(random.choices(string.ascii_letters, k=length))
 
 
@@ -49,53 +44,73 @@ def md5_hex(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-def retry_with_backoff(func, retries: int = 3, base_delay: float = 0.01):
-    """Exponential backoff + jitter, matching tokio_retry semantics."""
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            return func()
-        except Exception as e:  # noqa: BLE001 - mirror Rust retry semantics
-            last_exc = e
-            if attempt < retries - 1:
-                delay = base_delay * (2**attempt)
-                delay += random.uniform(0, delay)  # jitter
-                time.sleep(delay)
-    raise last_exc
+def safe_get(session: requests.Session, url: str, desc: str):
+    """带 403 降级的 GET"""
+    try:
+        r = session.get(url, timeout=15)
+        if r.status_code == 403:
+            print(f"⚠️ {desc} 被拒绝 (403)，IP / WAF 限制，跳过")
+            return None
+        r.raise_for_status()
+        return r
+    except Exception as e:
+        print(f"❌ {desc} 请求失败: {e}")
+        return None
 
 
 def get_input_value(soup: BeautifulSoup, name: str) -> str:
     el = soup.find("input", {"name": name})
-    if el and el.has_attr("value"):
-        return el["value"]
-    return "Unknown"
+    return el["value"] if el and el.has_attr("value") else "Unknown"
 
 
 # --------------------------------------------------------------------------- #
 # Network primitives
 # --------------------------------------------------------------------------- #
+
 def get_client() -> requests.Session:
-    """A reqwest Client with cookie_store(true); referer set per-request."""
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/114.0 Safari/537.36",
-        }
-    )
-    return session
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": MAIN_URL + "/",
+        "Connection": "keep-alive",
+    })
+
+    cookie = os.getenv("SIJISHE_COOKIE")
+    if cookie:
+        s.headers.update({"Cookie": cookie})
+        print("✅ 已注入 SIJISHE_COOKIE")
+    return s
 
 
 def get_login_params(session: requests.Session):
+    """有 Cookie 直接跳过，避免 403"""
+    if "Cookie" in session.headers:
+        print("✅ 使用 Cookie，跳过登录页解析")
+        return {"formhash": "", "referer": f"{MAIN_URL}/home.php?mod=space"}
+
     referer = f"{MAIN_URL}/home.php?mod=space"
-    resp = session.get(referer, headers={"Referer": f"{MAIN_URL}/"})
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    r = safe_get(session, referer, "获取登录参数")
+    if r is None:
+        return {"formhash": "", "referer": referer}
+
+    soup = BeautifulSoup(r.text, "lxml")
     el = soup.find("input", {"name": "formhash"})
     formhash = el["value"] if el and el.has_attr("value") else ""
     return {"formhash": formhash, "referer": referer}
 
 
 def login(session: requests.Session, account: dict, params: dict):
+    if "Cookie" in session.headers:
+        print("✅ Cookie 已登录，跳过账号密码登录")
+        return
+
+    print("⚠️ 尝试账号密码登录（GitHub IP 极易 403）")
     login_url = (
         f"{MAIN_URL}/member.php?mod=logging&action=login&loginsubmit=yes"
         f"&handlekey=login&loginhash=L{get_random_string(4)}&inajax=1"
@@ -108,97 +123,86 @@ def login(session: requests.Session, account: dict, params: dict):
         "questionid": "0",
         "answer": "",
     }
-    resp = session.post(login_url, headers={"Referer": params["referer"]}, data=payload)
-    resp.raise_for_status()
-    text = resp.text
-    if "欢迎您回来" in text:
-        print("🎉 [Success] Login successful!")
+    r = safe_get(session, login_url, "登录")
+    if r is None:
         return
-    raise RuntimeError(f"Login failed. Response snippet: {text[:100]}")
+    if "欢迎您回来" in r.text:
+        print("🎉 登录成功")
+    else:
+        raise RuntimeError("登录失败")
 
+
+# --------------------------------------------------------------------------- #
+# Check-in
+# --------------------------------------------------------------------------- #
 
 def get_check_in_params(session: requests.Session):
     referer = f"{MAIN_URL}/k_misign-sign.html"
+    r = safe_get(session, referer, "签到页")
+    if r is None:
+        return {"href": "", "referer": referer}
 
-    def attempt():
-        resp = session.get(referer, headers={"Referer": f"{MAIN_URL}/"})
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        el = soup.find("a", id="JD_sign")
-        if not el or not el.has_attr("href"):
-            raise RuntimeError("Failed to get check in href (maybe already checked in)")
-        return el["href"]
-
-    href = retry_with_backoff(attempt, retries=3, base_delay=0.01)
-    return {"href": href, "referer": referer}
+    soup = BeautifulSoup(r.text, "html.parser")
+    el = soup.find("a", id="JD_sign")
+    if not el or not el.has_attr("href"):
+        print("⚠️ 可能已签到")
+        return {"href": "", "referer": referer}
+    return {"href": el["href"], "referer": referer}
 
 
 def do_check_in(session: requests.Session, params: dict):
-    print("⏳ Executing check-in operation...")
-    check_in_url = f"{MAIN_URL}/{params['href']}"
-    resp = session.get(check_in_url, headers={"Referer": params["referer"]})
-    resp.raise_for_status()
-    text = resp.text
-    if "今日已签" in text or "您今天已经签到过了" in text:
-        print("✅ Already checked in today.")
-    elif "签到成功" in text or "CDATA" in text:
-        print("🎉 Check-in successful!")
+    if not params["href"]:
+        print("✅ 跳过签到")
+        return
+
+    print("⏳ 执行签到...")
+    r = safe_get(session, f"{MAIN_URL}/{params['href']}", "签到请求")
+    if r is None:
+        return
+
+    if "今日已签" in r.text or "您今天已经签到过了" in r.text:
+        print("✅ 今日已签到")
+    elif "签到成功" in r.text:
+        print("🎉 签到成功")
     else:
-        print(f"⚠️ Check-in failed or returned unexpected response: {text[:100]}")
+        print(f"⚠️ 签到异常: {r.text[:100]}")
 
 
 def print_user_info(session: requests.Session):
-    print("🔎 Fetching user info...")
-    url = f"{MAIN_URL}/k_misign-sign.html"
-    resp = session.get(url, headers={"Referer": f"{MAIN_URL}/"})
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    r = safe_get(session, f"{MAIN_URL}/k_misign-sign.html", "用户信息")
+    if r is None:
+        return
 
-    qiandao_num = get_input_value(soup, "qiandaobtnnum")
-    lxdays = get_input_value(soup, "lxdays")
-    lxtdays = get_input_value(soup, "lxtdays")
-    lxlevel = get_input_value(soup, "lxlevel")
-    lxreward = get_input_value(soup, "lxreward")
-
-    p_el = soup.select_one("li.nexmemberinfostwos > p")
-    total_reward = p_el.decode_contents() if p_el else "Unknown"
-
-    print(f"签到排名：{qiandao_num}")
-    print(f"签到等级：Lv.{lxlevel}")
-    print(f"连续签到：{lxdays} 天")
-    print(f"签到总数：{lxtdays} 天")
-    print(f"签到奖励：{lxreward}")
-    print(f"总积分：{total_reward}")
+    soup = BeautifulSoup(r.text, "html.parser")
+    print(f"签到排名：{get_input_value(soup, 'qiandaobtnnum')}")
+    print(f"连续签到：{get_input_value(soup, 'lxdays')} 天")
+    print(f"签到总数：{get_input_value(soup, 'lxtdays')} 天")
 
 
 # --------------------------------------------------------------------------- #
-# Account-level orchestration
+# Account
 # --------------------------------------------------------------------------- #
+
 def process_account_checkin(account: dict):
     session = get_client()
     params = get_login_params(session)
-    print(f"📝 Fetched login params: formhash={params['formhash']}")
     login(session, account, params)
     params = get_check_in_params(session)
-    print(f"📝 Fetched check-in params: href={params['href']}")
     do_check_in(session, params)
     print_user_info(session)
 
 
 # --------------------------------------------------------------------------- #
-# Shell completion (mirrors clap_complete generate)
-# --------------------------------------------------------------------------- #
 
-
-def main(argv=None) -> int:
+def main():
     accounts = get_accounts()
-    for account in accounts:
+    for acc in accounts:
         try:
-            process_account_checkin(account)
-            print(f"✅ Finished processing for {account['username']}")
+            process_account_checkin(acc)
+            print(f"✅ 完成: {acc['username']}")
         except Exception as e:
-            print(f"❌ Error processing {account['username']}: {e}", file=sys.stderr)
-    return 0
+            print(f"❌ 处理失败: {e}")
+
 
 if __name__ == "__main__":
     main()
