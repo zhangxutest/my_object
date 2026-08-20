@@ -28,6 +28,7 @@ jobs:
         env:
           SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
           SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
+          SIJISHE_COOKIE: ${{ secrets.SIJISHE_COOKIE }}
         run: |
           cd src
           python sijishe.py
