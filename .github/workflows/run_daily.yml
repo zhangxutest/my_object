@@ -3,7 +3,7 @@ name: Sijishe Daily Check-in
 on:
   schedule:
     - cron: '0 1 * * *'   # 北京时间 9:00
-  workflow_dispatch:
+  workflow_dispatch:      # 允许手动运行
 
 jobs:
   run:
@@ -18,19 +18,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Show files
-        run: |
-          pwd
-          ls -la
-            - name: Run check-in
-              env:
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r src/requirements.txt
 
       - name: Run check-in
         env:
           SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
           SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
-        run: python "$(find . -name sijishe.py | head -n1)"
+        run: |
+          cd src
+          python sijishe.py
