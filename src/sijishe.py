@@ -99,7 +99,7 @@ def get_login_params(session: requests.Session):
     if r is None:
         return {"formhash": "", "referer": referer}
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(r.text, "lxml")
     el = soup.find("input", {"name": "formhash"})
     formhash = el["value"] if el and el.has_attr("value") else ""
     return {"formhash": formhash, "referer": referer}
