@@ -11,19 +11,20 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      # ===================== 原有：拉代码 ===================== #
+      # ===================== 拉代码 ===================== #
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ===================== 原有：装 Python ===================== #
+      # ===================== 装 Python ===================== #
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ========== 新增：安装 Cloudflare WARP ========== #
+      # ========== 安装 Cloudflare WARP ========== #
       - name: Install Cloudflare WARP
         run: |
+          set -e
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
             sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
@@ -32,37 +33,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
 
-      # ========== 新增：启动 WARP SOCKS5 代理 ========== #
+      # ========== 启动 WARP SOCKS5 代理 ========== #
       - name: Start WARP SOCKS5 proxy
         run: |
+          set -e
           warp-cli --accept-tos registration new
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos proxy port 40000
           warp-cli --accept-tos connect
-          sleep 3
+          sleep 5
           echo "--- WARP 状态 ---"
-          warp-cli status
+          warp-cli --accept-tos status || true
           echo "--- 验证出口 IP（应显示 Cloudflare IP）---"
           curl -s --socks5 127.0.0.1:40000 https://ifconfig.me; echo
 
-      # ===================== 原有：装依赖 ===================== #
+      # ===================== 装依赖 ===================== #
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r src/requirements.txt
 
-      # ========== 改：通过 WARP 代理跑签到 ========== #
+      # ========== 通过 WARP 代理跑签到 ========== #
       - name: Run check-in via WARP
         env:
+          SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
+          SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
           SIJISHE_COOKIE: ${{ secrets.SIJISHE_COOKIE }}
           ALL_PROXY: socks5://127.0.0.1:40000
         run: |
           cd src
           python sijishe.py
 
-      # ========== 新增：关闭 WARP（清理） ========== #
+      # ========== 关闭 WARP（清理） ========== #
       - name: Stop WARP
         if: always()
         run: |
-          warp-cli disconnect || true
+          warp-cli --accept-tos disconnect || true
           echo "✅ WARP 已断开"
