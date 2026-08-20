@@ -1,15 +1,29 @@
-name: Run Python Daily
+name: Sijishe Daily Check-in
+
 on:
   schedule:
-    - cron: '0 1 * * *'   # 北京时间每天 9:00 = UTC 1:00
-  workflow_dispatch:       # 允许手动点按钮试跑
+    - cron: '0 1 * * *'   # 北京时间 9:00
+  workflow_dispatch:      # 手动触发
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python your_script.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run check-in
+        env:
+          SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
+          SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
+        run: python sijishe.py
