@@ -32,11 +32,13 @@ def get_accounts():
     if not cookie and (not username or not password):
         raise RuntimeError("Missing SIJISHE_USERNAME / PASSWORD / COOKIE")
 
-    return [{
-        "username": username or "cookie_user",
-        "password": password,
-        "cookie": cookie,
-    }]
+    return [
+        {
+            "username": username or "cookie_user",
+            "password": password,
+            "cookie": cookie,
+        }
+    ]
 
 
 def get_random_string(length: int) -> str:
