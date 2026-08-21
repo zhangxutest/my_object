@@ -2,7 +2,11 @@ name: Sijishe Daily Check-in
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 北京时间 9:00
+    - cron: '25 1 * * *'    # 北京时间 09:25
+    - cron: '25 4 * * *'    # 北京时间 10:25
+    - cron: '25 7 * * *'    # 北京时间 15:25
+    - cron: '25 10 * * *'   # 北京时间 18:25
+    - cron: '25 13 * * *'   # 北京时间 21:25
   workflow_dispatch:      # 允许手动运行
 
 jobs:
