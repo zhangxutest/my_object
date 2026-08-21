@@ -3,16 +3,14 @@
 
 ✅ Session + 浏览器级 Header
 ✅ Cookie 注入（SIJISHE_COOKIE 优先）
-✅ 403 降级（不抛异常、不炸 workflow）
+✅ Cookie 失效自动降级到账号密码登录（SIJISHE_USERNAME / SIJISHE_PASSWORD）
+✅ 403 降级（不抛异常、不炸 workflow），但登录/降级失败会明确报错
 """
 
 import hashlib
 import os
 import random
 import string
-import sys
-import time
-from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,16 +22,23 @@ MAIN_URL = "https://xsijishe.com"
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def get_accounts():
-    # Cookie 优先（Action 唯一稳的方式）
-    if os.getenv("SIJISHE_COOKIE"):
-        return [{"username": "cookie_user"}]
 
+def get_accounts():
+    # Cookie 与账号密码都允许存在：运行时优先试 Cookie，失效再降级到密码
+    cookie = os.getenv("SIJISHE_COOKIE")
     username = os.environ.get("SIJISHE_USERNAME")
     password = os.environ.get("SIJISHE_PASSWORD")
-    if not username or not password:
+
+    if not cookie and (not username or not password):
         raise RuntimeError("Missing SIJISHE_USERNAME / PASSWORD / COOKIE")
-    return [{"username": username, "password": password}]
+
+    return [
+        {
+            "username": username or "cookie_user",
+            "password": password,
+            "cookie": cookie,
+        }
+    ]
 
 
 def get_random_string(length: int) -> str:
@@ -67,33 +72,52 @@ def get_input_value(soup: BeautifulSoup, name: str) -> str:
 # Network primitives
 # --------------------------------------------------------------------------- #
 
-def get_client() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Referer": MAIN_URL + "/",
-        "Connection": "keep-alive",
-    })
 
-    cookie = os.getenv("SIJISHE_COOKIE")
+def get_client(account: dict) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": MAIN_URL + "/",
+            "Connection": "keep-alive",
+        }
+    )
+
+    cookie = account.get("cookie")
     if cookie:
         s.headers.update({"Cookie": cookie})
-        print("✅ 已注入 SIJISHE_COOKIE")
+        print("✅ 已注入 SIJISHE_COOKIE（稍后校验有效性）")
     return s
 
 
-def get_login_params(session: requests.Session):
-    """有 Cookie 直接跳过，避免 403"""
-    if "Cookie" in session.headers:
-        print("✅ 使用 Cookie，跳过登录页解析")
-        return {"formhash": "", "referer": f"{MAIN_URL}/home.php?mod=space"}
+def is_logged_in(session: requests.Session) -> bool:
+    """访问签到页，根据页面内容判断 Cookie 是否仍然有效。
 
+    返回 True 表示已登录（Cookie 有效），False 表示失效/未登录。
+    拿不准时保守返回 False，宁可多走一次账号密码登录。
+    """
+    r = safe_get(session, f"{MAIN_URL}/k_misign-sign.html", "校验登录态")
+    if r is None:
+        return False
+    text = r.text
+    # 已登录的正向标记
+    if 'id="JD_sign"' in text or "今日已签" in text or "您今天已经签到" in text:
+        return True
+    # 未登录的负向标记
+    if "请登录" in text or "action=login" in text or "用户登录" in text:
+        return False
+    # 既没找到签到按钮也没找到登录入口：保守认为失效，触发降级
+    return False
+
+
+def get_login_params(session: requests.Session):
+    """解析登录页 formhash（账号密码登录时使用）"""
     referer = f"{MAIN_URL}/home.php?mod=space"
     r = safe_get(session, referer, "获取登录参数")
     if r is None:
@@ -105,12 +129,20 @@ def get_login_params(session: requests.Session):
     return {"formhash": formhash, "referer": referer}
 
 
-def login(session: requests.Session, account: dict, params: dict):
-    if "Cookie" in session.headers:
-        print("✅ Cookie 已登录，跳过账号密码登录")
-        return
+def login(session: requests.Session, account: dict, params: dict = None):
+    """账号密码登录（仅在 Cookie 失效 / 未配置 Cookie 时调用）"""
+    if not account.get("username") or not account.get("password"):
+        raise RuntimeError(
+            "Cookie 已失效，但未配置 SIJISHE_USERNAME / SIJISHE_PASSWORD，无法降级登录"
+        )
 
-    print("⚠️ 尝试账号密码登录（GitHub IP 极易 403）")
+    # 清掉可能失效的手动 Cookie，让账号密码登录写入新的会话 Cookie
+    session.headers.pop("Cookie", None)
+
+    print("⚠️ 尝试账号密码登录")
+    if params is None:
+        params = get_login_params(session)
+
     login_url = (
         f"{MAIN_URL}/member.php?mod=logging&action=login&loginsubmit=yes"
         f"&handlekey=login&loginhash=L{get_random_string(4)}&inajax=1"
@@ -125,16 +157,17 @@ def login(session: requests.Session, account: dict, params: dict):
     }
     r = safe_get(session, login_url, "登录")
     if r is None:
-        return
+        raise RuntimeError("登录请求失败（可能被 403 / WAF 拦截）")
     if "欢迎您回来" in r.text:
         print("🎉 登录成功")
     else:
-        raise RuntimeError("登录失败")
+        raise RuntimeError("账号密码登录失败（用户名/密码错误或被拦截）")
 
 
 # --------------------------------------------------------------------------- #
 # Check-in
 # --------------------------------------------------------------------------- #
+
 
 def get_check_in_params(session: requests.Session):
     referer = f"{MAIN_URL}/k_misign-sign.html"
@@ -183,16 +216,27 @@ def print_user_info(session: requests.Session):
 # Account
 # --------------------------------------------------------------------------- #
 
+
 def process_account_checkin(account: dict):
-    session = get_client()
-    params = get_login_params(session)
-    login(session, account, params)
+    session = get_client(account)
+
+    if account.get("cookie"):
+        if is_logged_in(session):
+            print("✅ Cookie 有效，直接签到")
+        else:
+            print("⚠️ Cookie 失效，降级到账号密码登录")
+            login(session, account)
+    else:
+        print("ℹ️ 未配置 Cookie，使用账号密码登录")
+        login(session, account)
+
     params = get_check_in_params(session)
     do_check_in(session, params)
     print_user_info(session)
 
 
 # --------------------------------------------------------------------------- #
+
 
 def main():
     accounts = get_accounts()
