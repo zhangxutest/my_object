@@ -68,6 +68,29 @@ def get_input_value(soup: BeautifulSoup, name: str) -> str:
     return el["value"] if el and el.has_attr("value") else "Unknown"
 
 
+def export_fresh_cookie(session: requests.Session):
+    """账号密码登录成功后，把会话 Cookie 导出到文件，供 workflow 回写 GitHub Secret。
+
+    当前 session 用的请求走 WARP 代理（ALL_PROXY），但导出文件只是本地落盘，
+    与网络无关。导出的是 name=value; ... 形式的 Cookie 头字符串，可直接喂回
+    SIJISHE_COOKIE 使用。
+    """
+    export_path = os.environ.get("COOKIE_EXPORT_FILE")
+    if not export_path:
+        return  # 未配置导出路径则跳过（本地调试默认不写文件）
+    cookies = session.cookies.get_dict()
+    if not cookies:
+        print("⚠️ 会话中无可用 Cookie，跳过导出")
+        return
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    try:
+        with open(export_path, "w", encoding="utf-8") as f:
+            f.write(cookie_str)
+        print(f"✅ 已将新鲜 Cookie 导出到 {export_path}（供回写 Secret）")
+    except Exception as e:
+        print(f"⚠️ 导出 Cookie 失败: {e}")
+
+
 # --------------------------------------------------------------------------- #
 # Network primitives
 # --------------------------------------------------------------------------- #
@@ -160,6 +183,7 @@ def login(session: requests.Session, account: dict, params: dict = None):
         raise RuntimeError("登录请求失败（可能被 403 / WAF 拦截）")
     if "欢迎您回来" in r.text:
         print("🎉 登录成功")
+        export_fresh_cookie(session)  # 登录成功 → 导出新鲜 Cookie 供回写 Secret
     else:
         raise RuntimeError("账号密码登录失败（用户名/密码错误或被拦截）")
 
