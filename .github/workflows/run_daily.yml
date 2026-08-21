@@ -2,17 +2,23 @@ name: Sijishe Daily Check-in
 
 on:
   schedule:
-    - cron: '25 1 * * *'    # 北京时间 09:25
-    - cron: '25 4 * * *'    # 北京时间 10:25
-    - cron: '25 7 * * *'    # 北京时间 15:25
-    - cron: '25 10 * * *'   # 北京时间 18:25
-    - cron: '25 13 * * *'   # 北京时间 21:25
-  workflow_dispatch:      # 允许手动运行
+    # 多时间点 + 非整点(避开 GitHub 整点拥堵)，最大化触发成功率
+    # 脚本本身幂等：首次签到成功后，后续运行识别"今日已签"直接跳过，不会重复签
+    - cron: '17 1 * * *'    # 北京时间 09:17
+    - cron: '17 4 * * *'    # 北京时间 12:17
+    - cron: '17 7 * * *'    # 北京时间 15:17
+    - cron: '17 10 * * *'   # 北京时间 18:17
+    - cron: '17 13 * * *'   # 北京时间 21:17
+  workflow_dispatch:        # 允许手动运行
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 回写 Secret 需要 actions 写权限；contents: read 用于 checkout
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       # ===================== 拉代码 ===================== #
@@ -63,10 +69,29 @@ jobs:
           SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
           SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
           SIJISHE_COOKIE: ${{ secrets.SIJISHE_COOKIE }}
+          # 账号密码登录成功后，把新鲜 Cookie 导出到该文件，供下一步回写 Secret
+          COOKIE_EXPORT_FILE: ${{ github.workspace }}/src/fresh_cookie.txt
           ALL_PROXY: socks5://127.0.0.1:40000
         run: |
           cd src
           python sijishe.py
+
+      # ========== 把本次登录得到的新鲜 Cookie 回写 GitHub Secret ========== #
+      - name: Persist fresh cookie to Secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          FILE="${{ github.workspace }}/src/fresh_cookie.txt"
+          if [ -f "$FILE" ]; then
+            echo "📥 发现新鲜 Cookie，回写 SIJISHE_COOKIE Secret..."
+            gh secret set SIJISHE_COOKIE < "$FILE"
+            echo "✅ Secret SIJISHE_COOKIE 已更新（下次优先用新 Cookie，无需再降级）"
+            rm -f "$FILE"
+          else
+            echo "ℹ️ 本次未走账号密码登录（Cookie 仍有效），无需更新 Secret"
+          fi
 
       # ========== 关闭 WARP（清理） ========== #
       - name: Stop WARP
