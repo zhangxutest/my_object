@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sijishe CLI - Python port (GitHub Actions hardened).
 
+
 ✅ Session + 浏览器级 Header
 ✅ Cookie 注入（SIJISHE_COOKIE 优先）
 ✅ Cookie 失效自动降级到账号密码登录（SIJISHE_USERNAME / SIJISHE_PASSWORD）
