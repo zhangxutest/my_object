@@ -28,7 +28,8 @@ def get_accounts():
     cookie = os.getenv("SIJISHE_COOKIE")
     username = os.environ.get("SIJISHE_USERNAME")
     password = os.environ.get("SIJISHE_PASSWORD")
-
+    print("username",username)
+    print("password",password)
     if not cookie and (not username or not password):
         raise RuntimeError("Missing SIJISHE_USERNAME / PASSWORD / COOKIE")
 
