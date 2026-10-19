@@ -2,22 +2,20 @@ name: Sijishe Daily Check-in
 
 on:
   schedule:
-    # 多时间点 + 非整点(避开 GitHub 整点拥堵)，最大化触发成功率
-    # 脚本本身幂等：首次签到成功后，后续运行识别"今日已签"直接跳过，不会重复签
+    # 一天两次足够：脚本幂等 + Cookie 持久化，命中一次即可完成签到
+    # 非整点触发，避开 GitHub 调度高峰期的延迟/跳过
+    # 频率越高越容易触发站点 WAF 的 IP/行为封锁，不要再加大密度
     - cron: '17 1 * * *'    # 北京时间 09:17
-    - cron: '17 4 * * *'    # 北京时间 12:17
-    - cron: '17 7 * * *'    # 北京时间 15:17
-    - cron: '17 10 * * *'   # 北京时间 18:17
     - cron: '17 13 * * *'   # 北京时间 21:17
   workflow_dispatch:        # 允许手动运行
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # 回写 Secret 需要 actions 写权限；contents: read 用于 checkout
+    timeout-minutes: 20
     permissions:
-      actions: write
+      # 只需要 contents: read 用于 checkout
+      # 回写 Secret 不能用 GITHUB_TOKEN（它无权管理 Secret，会 403），见下方 Persist 步骤
       contents: read
 
     steps:
@@ -43,19 +41,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
 
-      # ========== 启动 WARP SOCKS5 代理 ========== #
+      # ========== 启动 WARP 并自检：不通就立刻失败 ========== #
+      # 绝不让签到请求从 GitHub 机房 IP 裸奔——那必然被站点 WAF 403
       - name: Start WARP SOCKS5 proxy
+        env:
+          PROXY_PORT: 40000
         run: |
           set -e
           warp-cli --accept-tos registration new
           warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos proxy port 40000
+          warp-cli --accept-tos proxy port $PROXY_PORT
           warp-cli --accept-tos connect
-          sleep 5
-          echo "--- WARP 状态 ---"
-          warp-cli --accept-tos status || true
-          echo "--- 验证出口 IP（应显示 Cloudflare IP）---"
-          curl -s --socks5 127.0.0.1:40000 https://ifconfig.me; echo
+          for i in $(seq 1 12); do
+            sleep 3
+            if IP=$(curl -fsS --max-time 10 --socks5 127.0.0.1:$PROXY_PORT https://ifconfig.me 2>/dev/null); then
+              echo "✅ WARP 就绪，当前出口 IP: $IP"
+              exit 0
+            fi
+            echo "⏳ 等待 WARP 就绪... ($i/12)"
+          done
+          echo "❌ WARP 未能连通，直接失败（否则请求将从 GitHub 机房 IP 发出，必被 403）"
+          exit 1
 
       # ===================== 装依赖 ===================== #
       - name: Install dependencies
@@ -63,8 +69,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r src/requirements.txt
 
-      # ========== 通过 WARP 代理跑签到 ========== #
-      - name: Run check-in via WARP
+      # ========== 通过 WARP 跑签到，失败自动换 IP 重试 ========== #
+      # 403 大概率是出口 IP 被站点 WAF 标记；重连 WARP 可换一个出口 IP 再试
+      - name: Run check-in via WARP (with retry)
         env:
           SIJISHE_USERNAME: ${{ secrets.SIJISHE_USERNAME }}
           SIJISHE_PASSWORD: ${{ secrets.SIJISHE_PASSWORD }}
@@ -72,26 +79,61 @@ jobs:
           # 账号密码登录成功后，把新鲜 Cookie 导出到该文件，供下一步回写 Secret
           COOKIE_EXPORT_FILE: ${{ github.workspace }}/src/fresh_cookie.txt
           ALL_PROXY: socks5://127.0.0.1:40000
+          PROXY_PORT: 40000
+          MAX_ATTEMPTS: 3
         run: |
+          set -e
           cd src
-          python sijishe.py
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=========== 第 $attempt/$MAX_ATTEMPTS 次尝试 ==========="
+            if python sijishe.py; then
+              echo "✅ 第 $attempt 次尝试成功"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "⚠️ 第 $attempt 次失败，重连 WARP 更换出口 IP 后重试..."
+              warp-cli --accept-tos disconnect || true
+              sleep 5
+              warp-cli --accept-tos connect || true
+              for i in $(seq 1 8); do
+                sleep 3
+                if NEW_IP=$(curl -fsS --max-time 10 --socks5 127.0.0.1:$PROXY_PORT https://ifconfig.me 2>/dev/null); then
+                  echo "✅ 新出口 IP: $NEW_IP"
+                  break
+                fi
+                echo "⏳ 等待新代理就绪... ($i/8)"
+              done
+            fi
+          done
+          echo "❌ 连续 $MAX_ATTEMPTS 次失败：大概率是出口 IP 被站点 WAF 封锁"
+          echo "   建议改用自建 Runner（自己的 IP）或住宅/手机代理，详见仓库说明"
+          exit 1
 
-      # ========== 把本次登录得到的新鲜 Cookie 回写 GitHub Secret ========== #
+      # ========== 把本次登录得到的新鲜 Cookie 回写 Secret ========== #
+      # 关键修复：GITHUB_TOKEN 无权管理仓库 Secret（GitHub 官方明确，actions: write 也不行），
+      # 用它调 gh secret set 必然 403（Resource not accessible by integration），
+      # 导致 Cookie 一直回写失败、每次都降级登录、更容易触发站点 WAF。
+      # 必须使用 PAT：fine-grained PAT 授予本仓库 Secrets: Read and write，
+      # 或 classic PAT 勾 repo scope，存为仓库 Secret「SIJISHE_PAT」。
       - name: Persist fresh cookie to Secret
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SIJISHE_PAT }}
         run: |
-          set -e
           FILE="${{ github.workspace }}/src/fresh_cookie.txt"
-          if [ -f "$FILE" ]; then
-            echo "📥 发现新鲜 Cookie，回写 SIJISHE_COOKIE Secret..."
-            gh secret set SIJISHE_COOKIE < "$FILE"
-            echo "✅ Secret SIJISHE_COOKIE 已更新（下次优先用新 Cookie，无需再降级）"
-            rm -f "$FILE"
-          else
+          if [ ! -f "$FILE" ]; then
             echo "ℹ️ 本次未走账号密码登录（Cookie 仍有效），无需更新 Secret"
+            exit 0
           fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️ 未配置 Secret SIJISHE_PAT，跳过 Cookie 回写"
+            echo "   请创建 PAT（本仓库 Secrets: Read and write）并存为 SIJISHE_PAT"
+            exit 0
+          fi
+          echo "📥 发现新鲜 Cookie，回写 SIJISHE_COOKIE Secret..."
+          gh secret set SIJISHE_COOKIE < "$FILE"
+          echo "✅ Secret SIJISHE_COOKIE 已更新（下次优先用新 Cookie，无需再降级）"
+          rm -f "$FILE"
 
       # ========== 关闭 WARP（清理） ========== #
       - name: Stop WARP
